@@ -1,0 +1,192 @@
+# coding=utf-8
+from __future__ import print_function, absolute_import
+from gm.api import *
+import datetime
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+
+ 
+def init(context):
+    
+    schedule(schedule_func=algo, date_rule='1d', time_rule='09:31:00') 
+    context.num = 30
+    context.rank_N = 9 # rank≤Œ ˝1:9
+    context.rank_M = 3 # rank≤Œ ˝2:3
+
+def algo(context):
+    today = context.now.strftime("%Y-%m-%d %H:%M:%S")
+    next_date = get_next_trading_date(exchange='SZSE', date=today)
+    last_date = get_previous_trading_date(exchange='SHSE', date=context.now)
+    if today[5:7]!=next_date[5:7]:
+        # all_stocks,all_stocks_str = get_normal_stocks(context.now)
+        all_stocks = get_history_constituents(index='SHSE.000300', start_date=last_date,end_date=last_date)
+        all_stocks_str = ','.join(all_stocks[0]['constituents'].keys())
+        factor = get_alpha_rank_mom(context,all_stocks_str,last_date,context.rank_N,context.rank_M)
+        trade_stocks = list(factor.replace([-np.inf,np.inf],np.nan).dropna().sort_values(ascending=False)[:context.num].index)
+        print(context.now,'¥˝¬Ú»Îπ…∆±{}÷ª£∫{}'.format(len(trade_stocks),trade_stocks))
+
+
+        positions = context.account().positions()
+
+        for position in positions:
+            symbol = position['symbol']
+            if symbol not in trade_stocks:
+                price_limit = get_history_instruments(symbol, fields='lower_limit', start_date=context.now, end_date=context.now, df=True)
+                new_price = history(symbol=symbol, frequency='60s', start_time=context.now, end_time=context.now, fields='close', df=True)
+                if symbol not in trade_stocks and (len(new_price)==0 or len(price_limit)==0 or price_limit['lower_limit'][0]!=round(new_price['close'][0],2)):
+                  
+                    order_target_percent(symbol=symbol, percent=0, order_type=OrderType_Market, position_side=PositionSide_Long)
+
+        for symbol in trade_stocks:
+            price_limit = get_history_instruments(symbol, fields='upper_limit', start_date=context.now, end_date=context.now, df=True)
+            new_price = history(symbol=symbol, frequency='60s', start_time=context.now, end_time=context.now, fields='close', df=True)
+            if len(new_price)==0 or len(price_limit)==0 or price_limit['upper_limit'][0]!=round(new_price['close'][0],2):
+              
+                order_target_percent(symbol=symbol, percent=1/len(trade_stocks), order_type=OrderType_Market, position_side=PositionSide_Long)
+
+def get_normal_stocks(date):
+
+    if isinstance(date,str):
+        date = datetime.datetime.strptime(date,"%Y-%m-%d %H:%M:%S")
+    df_code = get_instruments(sec_types=SEC_TYPE_STOCK, skip_suspended=True, skip_st=True, fields='symbol, sec_level, is_suspended, listed_date, delisted_date', df=True)
+    all_stocks = [code for code in df_code[(df_code['sec_level']==1)&(df_code['is_suspended']==0)&(df_code['listed_date']<=date-datetime.timedelta(days=365))&(df_code['delisted_date']>date)].symbol.to_list() if code[:6]!='SHSE.9' and code[:6]!='SZSE.2']
+    all_stocks_str = ','.join(all_stocks)
+    return all_stocks,all_stocks_str
+
+def get_alpha_rank_mom(context,security,date,N=9,M=3,frequency='1d'):
+
+    end_date = previous_month_timedelta(date,month_delta=M)
+    end_date = get_previous_trading_date(exchange='SZSE', date=end_date)
+
+    start_date = previous_month_timedelta(date,month_delta=M+N)
+    start_date = get_previous_trading_date(exchange='SZSE', date=start_date)
+    close = history_new(security,frequency=frequency,start_time=start_date,end_time=end_date,fields='eob,symbol,close',skip_suspended=True,fill_missing=None,adjust=ADJUST_POST,df=True).fillna(method='ffill')
+    rate = (close/close.shift(1)-1).iloc[1:,:]
+    rate = valid_sample_size(rate)
+    rank_rate = pd.DataFrame(columns=rate.columns)
+    for day in rate.index:
+     
+        df = pd.DataFrame(rate.loc[day,:]).dropna()
+        df.columns = ['factor']
+        df.sort_values('factor',inplace=True)
+        column0 = day
+        df[column0] = range(len(df))
+        
+        df_common = df.groupby('factor').apply(len)
+        df_common = df_common[df_common>1]
+        for common_factor in df_common.index:
+            common_rank = df.loc[df['factor']==common_factor,column0]
+            df.loc[df['factor']==common_factor,column0] = common_rank.mean()
+     
+        df_len = len(df)
+        df_stand = (df[[column0]]-(df_len+1)/2)/np.power((df_len+1)*(df_len-1)/12,1/2)
+        rank_rate = pd.concat([rank_rate,df[[column0]].T])
+
+    columns = rank_rate.columns
+    rank_rate['month'] = [date.strftime('%Y-%m') for date in rank_rate.index]
+    rank_rate_mean_byMonth = pd.DataFrame(columns = columns)
+    for month in set(rank_rate['month']):
+        df = rank_rate.loc[rank_rate['month']==month,:][columns].mean().to_frame().T
+        df.index = [datetime.datetime.strptime(month+'-1','%Y-%m-%d')]
+        rank_rate_mean_byMonth = pd.concat([rank_rate_mean_byMonth,df])
+    
+    if len(rank_rate_mean_byMonth)==1:
+        alpha_factor = rank_rate_mean_byMonth
+    else:
+        alpha_factor = rank_rate_mean_byMonth.mean()
+
+
+    alpha_factor = winsorize_med(alpha_factor)
+
+    alpha_factor = standardlize(alpha_factor)
+    alpha_factor = neutralize_MarketValue(context,alpha_factor,date)
+    return alpha_factor
+
+def previous_month_timedelta(date_,month_delta=1):
+
+    if isinstance(date_,datetime.datetime):
+        date_ = date_.strftime('%Y-%m-%d')
+    date_start = date_[:7]+'-01'
+    for i in range(month_delta):
+        date_start_time = (datetime.datetime.strptime(date_start,'%Y-%m-%d')-datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+        date_start = date_start_time[:7]+'-1'
+    return date_start
+
+def history_new(security,frequency,start_time,end_time,fields,skip_suspended=True,fill_missing=None,adjust=ADJUST_POST,df=True):
+    Data = pd.DataFrame()
+    trading_date = get_trading_dates(exchange='SZSE', start_date=start_time, end_date=end_time)
+    space = 10
+    if len(trading_date)<=space:
+        Data = history(security, frequency=frequency, start_time=start_time, end_time=end_time, fields=fields, skip_suspended=skip_suspended, fill_missing=fill_missing, adjust=adjust, df=df)
+    else:
+        for n in range(int(np.floor(len(trading_date)/space))):
+            start = n*space
+            end = start+space
+            if end==len(trading_date):
+                data = history(security, frequency=frequency, start_time=trading_date[start], end_time=trading_date[end-1], fields=fields, skip_suspended=skip_suspended, fill_missing=fill_missing, adjust=adjust, df=df)
+            else:
+                data = history(security, frequency=frequency, start_time=trading_date[start], end_time=trading_date[end], fields=fields, skip_suspended=skip_suspended, fill_missing=fill_missing, adjust=adjust, df=df)
+            Data = pd.concat([Data,data])
+    Data.drop_duplicates(keep='first',inplace=True)
+    Data = Data.set_index(['eob','symbol'])
+    Data = Data.unstack()
+    Data.columns = Data.columns.droplevel(level=0)
+    return Data
+
+def valid_sample_size(data,min_size_rate=2/3,axis=0):
+    min_size = int(round(len(data)*min_size_rate))
+    nan_data = np.isnan(data).sum(axis=axis)
+    security = nan_data[nan_data<min_size].index
+    data = data.loc[:,security]
+    return data
+
+def winsorize_med(data, scale=3, inclusive=True, inf2nan=True):
+  
+    data = data.astype('float')
+    if inf2nan:
+        data = data.replace([np.inf, -np.inf], np.nan)
+    std_ = data.std()
+    mean_ = data.mean()
+    if inclusive:
+        data[data>mean_+std_*scale]=mean_+std_*scale
+        data[data<mean_-std_*scale]=mean_-std_*scale
+    else:
+        data[data>mean_+std_*scale]=np.nan
+        data[data<mean_-std_*scale]=np.nan
+    return data
+
+def standardlize(data, inf2nan=True):
+   
+    if inf2nan:
+        data = data.replace([np.inf, -np.inf], np.nan)
+    return (data - data.mean()) / data.std()
+    
+def neutralize_MarketValue(context,data,date,counts=1):
+  
+    if isinstance(data,pd.Series):
+        data = data.to_frame()
+    security = data.index.to_list()
+    market_value = get_fundamentals_n(table='trading_derivative_indicator', symbols=security, end_date=date, fields='TOTMKTCAP',count=counts, df=True)
+    max_date = market_value['pub_date'].max()
+    market_value = market_value[market_value['pub_date']==max_date][['symbol','TOTMKTCAP']].set_index('symbol')
+    x = sm.add_constant(market_value)
+    common_index = list(set(x.index) & set(data.index))
+    x = x.loc[common_index,:]
+    data = data.loc[common_index,:]
+    residual = sm.OLS(data, x).fit().resid# ¥À¥¶ π”√◊Ó–°∂˛≥ÀªÿπÈº∆À„
+    return residual
+    
+    
+if __name__ == '__main__':
+    
+    run(strategy_id='adbd86dd-5d90-11ec-9850-7085c223669d',
+        filename='main.py',
+        mode=MODE_BACKTEST,
+        token='{{token}}',
+        backtest_start_time='2017-12-29 08:00:00',
+        backtest_end_time='2021-12-31 16:00:00',
+        backtest_adjust=ADJUST_PREV,
+        backtest_initial_cash=10000000,
+        backtest_commission_ratio=0.0016,# ¬Ú»ÎÕÚ»˝ ÷–¯∑—+¬Ù≥ˆÕÚ»˝ ÷–¯∑—∫Õ«ß1”°ª®À∞£¨√‚5
+        backtest_slippage_ratio=0.00246)
